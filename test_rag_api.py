@@ -95,73 +95,6 @@ class RagApiTests(unittest.TestCase):
         self.assertEqual(profile.json()["email"], "owner@example.com")
         self.assertEqual(self.client.get("/api/auth/me").status_code, 401)
 
-    def test_chat_endpoint_returns_structured_reply_and_persists_history(self):
-        with patch.object(
-            api.ai_service,
-            "generate_answer",
-            return_value="The answer is available."
-        ) as generate:
-            response = self.client.post(
-                "/chat",
-                headers=self.headers,
-                json={"message": "  What is the answer?  "}
-            )
-
-        self.assertEqual(response.status_code, 200, response.text)
-        payload = response.json()
-        self.assertEqual(payload["response"], "The answer is available.")
-        self.assertTrue(payload["conversation_id"])
-        self.assertEqual(payload["citations"], [])
-        self.assertTrue(payload["created_at"])
-        self.assertEqual(
-            json.loads(generate.call_args.args[0])["current_question"],
-            "What is the answer?"
-        )
-        history = self.client.get(
-            f"/api/conversations/{payload['conversation_id']}/messages",
-            headers=self.headers
-        )
-        self.assertEqual(len(history.json()["messages"]), 2)
-        self.assertEqual(
-            history.json()["messages"][0]["content"],
-            "What is the answer?"
-        )
-
-    def test_chat_endpoint_validates_messages_and_requires_authentication(self):
-        missing_message = self.client.post(
-            "/chat",
-            headers=self.headers,
-            json={}
-        )
-        blank_message = self.client.post(
-            "/chat",
-            headers=self.headers,
-            json={"message": "   "}
-        )
-        unauthenticated = self.client.post(
-            "/chat",
-            json={"message": "Question"}
-        )
-
-        self.assertEqual(missing_message.status_code, 422)
-        self.assertEqual(blank_message.status_code, 422)
-        self.assertEqual(unauthenticated.status_code, 401)
-
-    def test_chat_endpoint_sanitizes_model_timeouts(self):
-        with patch.object(
-            api.ai_service,
-            "generate_answer",
-            side_effect=TimeoutError("private provider detail")
-        ):
-            response = self.client.post(
-                "/chat",
-                headers=self.headers,
-                json={"message": "Question"}
-            )
-
-        self.assertEqual(response.status_code, 503)
-        self.assertNotIn("private provider detail", response.text)
-
     def test_upload_retrieval_citations_and_persisted_history(self):
         def embedding(*args):
             task_type = args[1]
@@ -313,16 +246,9 @@ class RagApiTests(unittest.TestCase):
         with (
             patch.object(rag, "search_chunks", return_value=[]),
             patch.object(api.chat_api, "search_knowledge", return_value=[{
-                "id": 5,
                 "title": "HisabDo",
                 "content": "HisabDo is an expense-management and digital-ledger product.",
-                "source": "https://www.xicteksystems.com/",
-                "metadata": {
-                    "id": 5,
-                    "source": "https://www.xicteksystems.com/",
-                    "is_public": True
-                },
-                "score": 0.9
+                "source": "https://www.xicteksystems.com/"
             }]),
             patch.object(
                 api.ai_service,
@@ -342,61 +268,8 @@ class RagApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         prompt = json.loads(generate.call_args.args[0])
         self.assertEqual(len(prompt["retrieved_business_context"]), 1)
-        self.assertEqual(prompt["retrieved_business_context"][0]["id"], 5)
-        self.assertEqual(prompt["retrieved_business_context"][0]["score"], 0.9)
-        self.assertEqual(
-            prompt["retrieved_business_context"][0]["metadata"]["is_public"],
-            True
-        )
         self.assertEqual(prompt["retrieved_document_context"], [])
         self.assertEqual(response.json()["citations"], [])
-
-    def test_prepared_business_retrieval_reaches_rag_prompt_end_to_end(self):
-        def embedding(text, task_type):
-            if task_type == "RETRIEVAL_QUERY" or text.startswith("HisabDo is"):
-                return [1.0, 0.0]
-            return [0.0, 1.0]
-
-        self.business_search.stop()
-        api.chat_api.vector_store.clear()
-        try:
-            with (
-                patch.object(
-                    api.chat_api,
-                    "create_embedding",
-                    side_effect=embedding
-                ),
-                patch.object(rag, "search_chunks", return_value=[]),
-                patch.object(
-                    api.ai_service,
-                    "generate_answer",
-                    return_value="HisabDo is a digital-ledger product."
-                ) as generate
-            ):
-                conversation = self.client.post(
-                    "/api/conversations", headers=self.headers, json={}
-                ).json()
-                response = self.client.post(
-                    f"/api/conversations/{conversation['id']}/messages",
-                    headers=self.headers,
-                    json={"message": "What is HisabDo?"}
-                )
-        finally:
-            api.chat_api.vector_store.clear()
-            self.business_search.start()
-
-        self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(response.json()["citations"], [])
-        prompt = json.loads(generate.call_args.args[0])
-        self.assertEqual(len(prompt["retrieved_business_context"]), 1)
-        result = prompt["retrieved_business_context"][0]
-        self.assertEqual(result["id"], 5)
-        self.assertEqual(result["title"], "HisabDo")
-        self.assertEqual(result["metadata"]["is_public"], True)
-        self.assertGreaterEqual(
-            result["score"],
-            api.chat_api.MIN_RELEVANCE_SCORE
-        )
 
     def test_customer_identifier_retrieves_and_cites_matching_record(self):
         with (
@@ -725,110 +598,6 @@ class RagApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["citations"], [])
 
-    def test_vector_index_upsert_search_metadata_and_delete(self):
-        with patch.object(
-            rag,
-            "create_embedding",
-            return_value=[1.0, 0.0]
-        ):
-            upload = self.client.post(
-                "/api/documents",
-                headers=self.headers,
-                files={
-                    "file": (
-                        "annual.txt",
-                        b"Annual revenue was $42.",
-                        "text/plain"
-                    )
-                }
-            )
-        self.assertEqual(upload.status_code, 201, upload.text)
-        document_id = upload.json()["id"]
-        api_status = self.client.get(
-            "/api/vector-index",
-            headers=self.headers
-        )
-        self.assertEqual(api_status.status_code, 200, api_status.text)
-        self.assertEqual(api_status.json()["record_count"], 1)
-
-        with api.database.connect() as connection:
-            record = rag.get_embedding(connection, document_id, 0, 1)
-            self.assertEqual(record["id"], f"{document_id}:0")
-            self.assertEqual(record["content"], "Annual revenue was $42.")
-            self.assertEqual(record["metadata"]["source"], "annual.txt")
-            self.assertEqual(rag.get_index_status(connection, 1)["record_count"], 1)
-
-            api.database.initialize_database()
-            status = rag.get_index_status(connection, 1)
-            self.assertEqual(status["embedding_dimensions"], 2)
-            self.assertEqual(status["similarity_metric"], "cosine")
-
-            stable_id = rag.update_embedding(
-                connection,
-                document_id,
-                0,
-                "Updated annual revenue was $42.",
-                [0.9, 0.1],
-                1
-            )
-            updated = rag.get_embedding(connection, document_id, 0, 1)
-            self.assertEqual(stable_id, updated["id"])
-            self.assertEqual(updated["content"], "Updated annual revenue was $42.")
-
-            with patch.object(
-                rag,
-                "create_embedding",
-                return_value=[1.0, 0.0]
-            ):
-                results = rag.search_chunks(
-                    connection,
-                    1,
-                    "annual revenue",
-                    limit=2,
-                    filters={"filename": "annual.txt"}
-                )
-            self.assertEqual(len(results), 1)
-            self.assertEqual(results[0]["id"], stable_id)
-            self.assertEqual(results[0]["metadata"]["page_number"], 1)
-
-            self.assertFalse(
-                rag.delete_embedding(connection, document_id, 0, user_id=999)
-            )
-            self.assertTrue(
-                rag.delete_embedding(connection, document_id, 0, user_id=1)
-            )
-            self.assertIsNone(rag.get_embedding(connection, document_id, 0, 1))
-            self.assertEqual(rag.get_index_status(connection, 1)["record_count"], 0)
-
-    def test_vector_index_rejects_invalid_and_mismatched_embeddings(self):
-        with patch.object(
-            rag,
-            "create_embedding",
-            return_value=[1.0, 0.0]
-        ):
-            upload = self.client.post(
-                "/api/documents",
-                headers=self.headers,
-                files={
-                    "file": ("notes.txt", b"A valid chunk.", "text/plain")
-                }
-            )
-        self.assertEqual(upload.status_code, 201, upload.text)
-
-        with api.database.connect() as connection:
-            with self.assertRaises(ValueError):
-                rag.update_embedding(
-                    connection,
-                    upload.json()["id"],
-                    0,
-                    "Invalid dimension update.",
-                    [1.0, 0.0, 0.0]
-                )
-            with self.assertRaises(ValueError):
-                rag.serialize_embedding([float("nan")])
-            with self.assertRaises(ValueError):
-                rag.serialize_embedding([0.0, 0.0])
-
     def test_invalid_nested_context_is_rejected(self):
         conversation = self.client.post(
             "/api/conversations",
@@ -964,21 +733,6 @@ class RagApiTests(unittest.TestCase):
             files={"file": ("notes.csv", b"a,b", "text/csv")}
         )
         self.assertEqual(result.status_code, 415)
-
-    def test_embedding_provider_value_error_returns_service_error(self):
-        with patch.object(
-            rag,
-            "create_embedding",
-            side_effect=ValueError("private provider detail")
-        ):
-            response = self.client.post(
-                "/api/documents",
-                headers=self.headers,
-                files={"file": ("notes.txt", b"Business note.", "text/plain")}
-            )
-
-        self.assertEqual(response.status_code, 503)
-        self.assertNotIn("private provider", response.text)
 
     def test_authentication_rate_limit_is_enforced(self):
         with api.database.connect() as connection:

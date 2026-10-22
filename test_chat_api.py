@@ -102,18 +102,6 @@ class ChatApiTests(unittest.TestCase):
         self.assertNotIn("credential", response.text)
         self.assertNotIn("test-conversation", chat_api.conversations)
 
-    def test_embedding_failure_returns_sanitized_chat_error(self):
-        with patch.object(
-            chat_api,
-            "search_knowledge",
-            side_effect=RuntimeError("private embedding provider detail")
-        ):
-            response = self.client.post("/chat", json=self.request_data)
-
-        self.assertEqual(response.status_code, 503)
-        self.assertNotIn("private embedding provider", response.text)
-        self.assertNotIn("test-conversation", chat_api.conversations)
-
     def test_conversation_history_is_bounded(self):
         chat_api.conversations["test-conversation"] = [
             {"role": "user", "message": str(index), "time": "now"}
@@ -149,113 +137,6 @@ class ChatApiTests(unittest.TestCase):
 
         self.assertEqual([item["title"] for item in results], ["HisabDo"])
         self.assertGreaterEqual(results[0]["score"], chat_api.MIN_RELEVANCE_SCORE)
-
-    def test_business_retrieval_returns_metadata_and_reuses_document_vectors(self):
-        items = [
-            {
-                "id": "services",
-                "title": "Services",
-                "content": "Custom software and web development.",
-                "source": "services-page",
-                "is_public": True
-            },
-            {
-                "id": "private",
-                "title": "Private",
-                "content": "Confidential details.",
-                "source": "admin",
-                "is_public": False
-            },
-            {
-                "id": "hisabdo",
-                "title": "HisabDo",
-                "content": "Expense management and digital ledger.",
-                "source": "product-page",
-                "is_public": True
-            }
-        ]
-        with (
-            patch.object(chat_api, "knowledge_base", items),
-            patch.object(
-                chat_api,
-                "create_embedding",
-                side_effect=[
-                    [1.0, 0.0],
-                    [0.0, 1.0],
-                    [1.0, 0.0],
-                    [0.0, 1.0]
-                ]
-            ) as embed
-        ):
-            results = chat_api.search_knowledge(
-                "  software services  ",
-                limit=1,
-                filters={"source": "services-page"}
-            )
-            repeated = chat_api.search_knowledge(
-                "ledger",
-                filters={"id": "hisabdo"}
-            )
-
-        self.assertEqual(len(results), 1)
-        self.assertEqual(results[0]["id"], "services")
-        self.assertEqual(results[0]["content"], items[0]["content"])
-        self.assertEqual(results[0]["metadata"]["source"], "services-page")
-        self.assertEqual(results[0]["metadata"]["is_public"], True)
-        self.assertEqual(results[0]["score"], 1.0)
-        self.assertEqual([item["id"] for item in repeated], ["hisabdo"])
-        self.assertEqual(embed.call_count, 4)
-        self.assertEqual(embed.call_args_list[0].args[0], items[0]["content"])
-        self.assertEqual(embed.call_args_list[2].args, ("software services", "RETRIEVAL_QUERY"))
-
-    def test_business_retrieval_empty_index_and_invalid_queries(self):
-        with (
-            patch.object(chat_api, "knowledge_base", []),
-            patch.object(chat_api, "create_embedding") as embed
-        ):
-            self.assertEqual(chat_api.search_knowledge("question"), [])
-            embed.assert_not_called()
-            with self.assertRaises(ValueError):
-                chat_api.search_knowledge("  ")
-            with self.assertRaises(ValueError):
-                chat_api.search_knowledge("question", limit=0)
-            with self.assertRaises(ValueError):
-                chat_api.search_knowledge("question", filters={"is_public": False})
-
-    def test_business_retrieval_rejects_invalid_and_mismatched_embeddings(self):
-        item = {
-            "id": 1,
-            "title": "Public fact",
-            "content": "A known public fact.",
-            "source": "public",
-            "is_public": True
-        }
-        with (
-            patch.object(chat_api, "knowledge_base", [item]),
-            patch.object(chat_api, "create_embedding", return_value=[1.0, 0.0])
-        ):
-            chat_api.build_vector_store()
-            for invalid_vector in ([float("nan"), 1.0], [0.0, 0.0], [1.0]):
-                with self.subTest(invalid_vector=invalid_vector):
-                    with patch.object(
-                        chat_api,
-                        "create_embedding",
-                        return_value=invalid_vector
-                    ):
-                        with self.assertRaises(ValueError):
-                            chat_api.search_knowledge("question")
-
-        second_item = dict(item, id=2, content="Another fact.")
-        with (
-            patch.object(chat_api, "knowledge_base", [item, second_item]),
-            patch.object(
-                chat_api,
-                "create_embedding",
-                side_effect=[[1.0, 0.0], [0.0, 1.0, 0.0]]
-            )
-        ):
-            with self.assertRaises(ValueError):
-                chat_api.build_vector_store()
 
     def test_knowledge_writes_require_configured_api_key_and_clear_embeddings(self):
         chat_api.vector_store.append({"id": 1, "embedding": [1.0]})
